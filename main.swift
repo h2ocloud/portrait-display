@@ -276,7 +276,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let candidates = displays.filter { d in
                 !d.isMain && d.id != virtualDisplayID && d.rotation == 0
             }
-            if candidates.count == 1 {
+            // Prefer 1920x1080 display (Samsung C24F390) as portrait target
+            if let preferred = candidates.first(where: { $0.width == 1920 && $0.height == 1080 }) {
+                target = preferred
+            } else if candidates.count == 1 {
                 target = candidates[0]
             } else {
                 print("Multiple candidates. Specify target display ID:")
