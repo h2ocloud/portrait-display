@@ -80,6 +80,27 @@ func printDisplays(_ displays: [DisplayInfo]) {
     print()
 }
 
+// MARK: - Safety: never cover the built-in screen
+
+/// Returns true if the screen is the MacBook built-in display.
+/// Uses CGDisplayIsBuiltin (checks hardware connection) which is more reliable
+/// than NSScreen.main (which follows keyboard focus).
+func isBuiltInScreen(_ screen: NSScreen) -> Bool {
+    guard let screenID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
+        return false
+    }
+    return CGDisplayIsBuiltin(screenID) != 0
+}
+
+/// Returns true if the screen is either built-in OR the CGDisplay main screen.
+/// We protect both to be safe.
+func isProtectedScreen(_ screen: NSScreen) -> Bool {
+    guard let screenID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
+        return false
+    }
+    return CGDisplayIsBuiltin(screenID) != 0 || CGDisplayIsMain(screenID) != 0
+}
+
 // MARK: - ScreenCaptureKit Stream Output
 
 class StreamOutput: NSObject, SCStreamOutput {
@@ -89,12 +110,10 @@ class StreamOutput: NSObject, SCStreamOutput {
         guard type == .screen else { return }
         guard let pixelBuffer = sampleBuffer.imageBuffer else { return }
 
-        // Get IOSurface directly — zero-copy GPU path, no CPU image conversion
         let ioSurface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue()
 
         DispatchQueue.main.async { [weak self] in
             guard let layer = self?.imageLayer else { return }
-            // Disable implicit animations to eliminate ghosting
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             layer.contents = ioSurface
@@ -115,6 +134,7 @@ class StreamController: NSObject {
     var scStream: SCStream?
     var streamOutput: StreamOutput?
     private var isRestarting = false
+    private var safetyTimer: Timer?
 
     init(sourceDisplayID: CGDirectDisplayID, targetScreen: NSScreen) {
         self.sourceDisplayID = sourceDisplayID
@@ -125,7 +145,13 @@ class StreamController: NSObject {
     }
 
     func start() {
-        // Create borderless fullscreen window on target screen
+        // SAFETY: refuse to place fullscreen window on the main screen
+        if isProtectedScreen(targetScreen) {
+            print("SAFETY: Refusing to create fullscreen window on main display — aborting")
+            NSApp.terminate(nil)
+            return
+        }
+
         let frame = targetScreen.frame
         let win = NSWindow(
             contentRect: frame,
@@ -145,8 +171,6 @@ class StreamController: NSObject {
         win.contentView = view
 
         let layer = CALayer()
-        // Layer is portrait-sized (1080x1920) but rotated 90° CW to fill landscape screen
-        // Center the layer in the view, then rotate
         let screenW = frame.size.width
         let screenH = frame.size.height
         layer.bounds = CGRect(x: 0, y: 0, width: screenH, height: screenW)
@@ -154,7 +178,6 @@ class StreamController: NSObject {
         layer.transform = CATransform3DMakeRotation(.pi / 2, 0, 0, 1)
         layer.contentsGravity = .resize
         layer.backgroundColor = NSColor.black.cgColor
-        // Disable all implicit animations to prevent ghosting
         layer.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
         view.layer?.addSublayer(layer)
         self.imageLayer = layer
@@ -163,53 +186,87 @@ class StreamController: NSObject {
         win.orderFrontRegardless()
         self.window = win
 
-        // Start ScreenCaptureKit capture
+        // Verify window actually landed on the right screen
+        if let actualScreen = win.screen, isProtectedScreen(actualScreen) {
+            print("SAFETY: Window landed on main screen despite targeting another — closing immediately")
+            win.close()
+            self.window = nil
+            NSApp.terminate(nil)
+            return
+        }
+
         startSCKCapture()
-
-        // Listen for screen wake/unlock to restart stream
         registerWakeObservers()
-
-        // Monitor for display disconnect — if USB adapter is unplugged,
-        // close the fullscreen window immediately to avoid covering the MacBook screen
         registerDisplayChangeCallback()
+        startSafetyTimer()
     }
+
+    // MARK: - Display disconnect watchdog
 
     func registerDisplayChangeCallback() {
         CGDisplayRegisterReconfigurationCallback({ displayID, flags, userInfo in
-            // Only react when reconfiguration is complete
             guard flags.contains(.beginConfigurationFlag) == false else { return }
             let controller = Unmanaged<StreamController>.fromOpaque(userInfo!).takeUnretainedValue()
-            controller.checkTargetDisplayAlive()
+            controller.handleDisplayReconfiguration()
         }, Unmanaged.passUnretained(self).toOpaque())
         print("✓ Registered display disconnect watchdog")
     }
 
-    func checkTargetDisplayAlive() {
-        // Check if any screen still matches our target dimensions
+    func handleDisplayReconfiguration() {
+        DispatchQueue.main.async { [weak self] in
+            self?.verifySafety()
+        }
+    }
+
+    // MARK: - Periodic safety check
+
+    func startSafetyTimer() {
+        // Check every 2 seconds that our window isn't covering the main screen
+        safetyTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.verifySafety()
+        }
+        print("✓ Safety timer active (2s interval)")
+    }
+
+    func verifySafety() {
+        // Check 1: is the target display still connected?
         let targetAlive = NSScreen.screens.contains(where: { screen in
+            !isProtectedScreen(screen) &&
             Int(screen.frame.width) == targetWidth && Int(screen.frame.height) == targetHeight
         })
 
         if !targetAlive {
-            print("⚠ Target display (\(targetWidth)x\(targetHeight)) disconnected — shutting down to avoid covering MacBook screen")
-            DispatchQueue.main.async {
-                self.stop()
-                NSApp.terminate(nil)
-            }
+            print("⚠ Target display (\(targetWidth)x\(targetHeight)) disconnected — shutting down")
+            emergencyShutdown()
+            return
+        }
+
+        // Check 2: did our window migrate to the main screen?
+        if let win = window, let winScreen = win.screen, isProtectedScreen(winScreen) {
+            print("⚠ Fullscreen window migrated to main screen — shutting down")
+            emergencyShutdown()
+            return
         }
     }
+
+    func emergencyShutdown() {
+        // Close window FIRST to unblock the screen, then clean up
+        window?.close()
+        window = nil
+        stop()
+        NSApp.terminate(nil)
+    }
+
+    // MARK: - Wake/unlock recovery
 
     func registerWakeObservers() {
         let ws = NSWorkspace.shared.notificationCenter
         let nc = DistributedNotificationCenter.default()
 
-        // Screen wake from sleep
         ws.addObserver(self, selector: #selector(handleWake(_:)),
                        name: NSWorkspace.screensDidWakeNotification, object: nil)
-        // Session becomes active (unlock / screensaver dismiss)
         ws.addObserver(self, selector: #selector(handleWake(_:)),
                        name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
-        // Screen unlock (covers screensaver + lock screen)
         nc.addObserver(self, selector: #selector(handleWake(_:)),
                        name: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil)
 
@@ -222,15 +279,15 @@ class StreamController: NSObject {
         let reason = notification.name.rawValue.components(separatedBy: ".").last ?? "unknown"
         print("⟳ Wake/unlock detected (\(reason)), restarting stream in 2s...")
 
-        // Delay to let displays stabilize after wake
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.restartStream()
+            guard let self = self else { return }
+            // Safety check before restarting
+            self.verifySafety()
+            self.restartStream()
         }
     }
 
-
     func restartStream() {
-        // Stop existing stream
         if let stream = scStream {
             stream.stopCapture { [weak self] _ in
                 DispatchQueue.main.async {
@@ -246,6 +303,8 @@ class StreamController: NSObject {
         }
     }
 
+    // MARK: - ScreenCaptureKit
+
     func startSCKCapture() {
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [weak self] content, error in
             guard let self = self, let content = content else {
@@ -253,7 +312,6 @@ class StreamController: NSObject {
                 return
             }
 
-            // Find the SCDisplay matching our virtual display
             guard let scDisplay = content.displays.first(where: { $0.displayID == self.sourceDisplayID }) else {
                 print("ERROR: Virtual display \(self.sourceDisplayID) not found in ScreenCaptureKit")
                 print("Available displays:")
@@ -263,7 +321,6 @@ class StreamController: NSObject {
                 return
             }
 
-            // Exclude our own streaming window from capture to avoid recursion
             let excludedWindows = content.windows.filter { w in
                 w.owningApplication?.bundleIdentifier == Bundle.main.bundleIdentifier
             }
@@ -272,10 +329,10 @@ class StreamController: NSObject {
             let config = SCStreamConfiguration()
             config.width = 1080
             config.height = 1920
-            config.minimumFrameInterval = CMTime(value: 1, timescale: 60) // 60fps
+            config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
             config.pixelFormat = kCVPixelFormatType_32BGRA
             config.showsCursor = true
-            config.queueDepth = 3  // minimize latency
+            config.queueDepth = 3
 
             let stream = SCStream(filter: filter, configuration: config, delegate: nil)
             let output = StreamOutput()
@@ -299,10 +356,14 @@ class StreamController: NSObject {
         }
     }
 
+    // MARK: - Cleanup
+
     func stop() {
+        safetyTimer?.invalidate()
+        safetyTimer = nil
         CGDisplayRemoveReconfigurationCallback({ displayID, flags, userInfo in
             let controller = Unmanaged<StreamController>.fromOpaque(userInfo!).takeUnretainedValue()
-            controller.checkTargetDisplayAlive()
+            controller.handleDisplayReconfiguration()
         }, Unmanaged.passUnretained(self).toOpaque())
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         DistributedNotificationCenter.default().removeObserver(self)
@@ -337,9 +398,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func startPortraitStreaming(args: [String]) {
         let targetDisplayID: CGDirectDisplayID? = args.count > 2 ? UInt32(args[2]) : nil
 
-        // IMPORTANT: Capture the target NSScreen BEFORE creating the virtual display,
-        // because MCT USB displays may disappear from the active display list
-        // when a CGVirtualDisplay is created.
+        // Capture target BEFORE creating virtual display (MCT displays may vanish after)
         let displays = getDisplays()
         printDisplays(displays)
 
@@ -369,7 +428,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Lock the target NSScreen by frame position before virtual display creation
+        // SAFETY: refuse to target the main display
+        if target.isMain {
+            print("SAFETY: Target display is the main display — aborting")
+            NSApp.terminate(nil)
+            return
+        }
+
+        // Lock the target NSScreen before virtual display creation
         guard let targetScreen = NSScreen.screens.first(where: { screen in
             let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
             return num == target.id
@@ -389,7 +455,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         virtualDisplay = vd
         print("✓ Virtual display ID: \(vd.displayID)")
 
-        // Wait for virtual display to register, then find target screen by saved frame
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [self] in
             self.setupStreaming(virtualDisplayID: vd.displayID, savedTargetFrame: targetFrame, targetWidth: target.width, targetHeight: target.height)
         }
@@ -400,34 +465,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var debugLines = [String]()
         debugLines.append("[\(Date())] setupStreaming: saved frame:\(savedTargetFrame)")
 
-        // Re-scan NSScreens and match by frame origin (most stable identifier)
         for screen in NSScreen.screens {
             let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
-            debugLines.append("  NSScreen ID:\(num) frame:\(screen.frame)")
+            debugLines.append("  NSScreen ID:\(num) frame:\(screen.frame) protected:\(isProtectedScreen(screen))")
         }
 
-        // Try matching by frame origin (position persists even if ID changes)
+        // Match by frame origin + size
         var targetScreen = NSScreen.screens.first(where: { screen in
+            !isProtectedScreen(screen) &&
             screen.frame.origin == savedTargetFrame.origin &&
             Int(screen.frame.width) == Int(savedTargetFrame.width) &&
             Int(screen.frame.height) == Int(savedTargetFrame.height)
         })
 
-        // Fallback: match by frame size only, excluding main and virtual
+        // Fallback: match by size only, excluding main and virtual
         if targetScreen == nil {
             debugLines.append("  Frame origin match failed, falling back to size match")
             targetScreen = NSScreen.screens.first(where: { screen in
                 let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
-                return num != 1 && num != virtualDisplayID &&
+                return !isProtectedScreen(screen) && num != virtualDisplayID &&
                     Int(screen.frame.width) == targetWidth && Int(screen.frame.height) == targetHeight
             })
         }
 
         guard let targetScreen = targetScreen else {
-            debugLines.append("  ERROR: No NSScreen matched — target may have disconnected")
+            debugLines.append("  ERROR: No safe NSScreen matched — aborting to protect main screen")
             try? debugLines.joined(separator: "\n").appending("\n").write(toFile: logFile, atomically: true, encoding: .utf8)
-            print("ERROR: Target screen disappeared after virtual display creation")
-            print("  This is a known MCT driver issue. Try the hardware fallback approach.")
+            print("ERROR: Target screen not found after virtual display creation — aborting safely")
+            virtualDisplay = nil
+            NSApp.terminate(nil)
+            return
+        }
+
+        // FINAL SAFETY: double-check this isn't the main screen
+        if isProtectedScreen(targetScreen) {
+            debugLines.append("  SAFETY: matched screen is main display — aborting")
+            try? debugLines.joined(separator: "\n").appending("\n").write(toFile: logFile, atomically: true, encoding: .utf8)
+            print("SAFETY: Matched screen is the main display — aborting")
+            virtualDisplay = nil
             NSApp.terminate(nil)
             return
         }
@@ -437,7 +512,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         try? debugLines.joined(separator: "\n").appending("\n").write(toFile: logFile, atomically: true, encoding: .utf8)
         print("Step 3: Target screen matched → ID:\(matchedID) frame:\(targetScreen.frame)")
 
-        print("Step 3: Starting stream...")
+        print("Step 4: Starting stream...")
         let ctrl = StreamController(sourceDisplayID: virtualDisplayID, targetScreen: targetScreen)
         ctrl.start()
         self.streamController = ctrl
@@ -459,10 +534,8 @@ func printBanner(targetID: CGDirectDisplayID, targetWidth: Int, targetHeight: In
     ║  Virtual workspace: 1080x1920 (portrait)         ║
     ║  Streaming to:      ID:\(targetID) (\(targetWidth)x\(targetHeight))      ║
     ║                                                  ║
-    ║  → System Settings → Displays → Arrange          ║
-    ║  → Position "Portrait Virtual" where you want    ║
-    ║  → Drag windows to the virtual display           ║
-    ║  → Physically rotate your monitor 90°            ║
+    ║  Safety: auto-exit if target disconnects or      ║
+    ║          window migrates to main screen           ║
     ║                                                  ║
     ║  Ctrl+C to stop                                  ║
     ╚══════════════════════════════════════════════════╝
@@ -478,11 +551,10 @@ func printUsage() {
       portrait-display list                List all active displays
       portrait-display help                Show this help
 
-    How it works:
-      1. Creates a virtual 1080x1920 portrait display
-      2. Captures it with ScreenCaptureKit at 30fps
-      3. Renders on a fullscreen window on the target USB display
-      4. Physically rotate the monitor for portrait viewing
+    Safety:
+      - Will NEVER place a fullscreen window on the main display
+      - Auto-exits when USB display is disconnected
+      - Periodic check every 2s to prevent main screen coverage
 
     The virtual display is your workspace. The USB display is the renderer.
     """)
