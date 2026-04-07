@@ -105,17 +105,19 @@ class StreamOutput: NSObject, SCStreamOutput {
 
 // MARK: - Stream Controller
 
-class StreamController {
+class StreamController: NSObject {
     let sourceDisplayID: CGDirectDisplayID
     let targetScreen: NSScreen
     var window: NSWindow?
     var imageLayer: CALayer?
     var scStream: SCStream?
     var streamOutput: StreamOutput?
+    private var isRestarting = false
 
     init(sourceDisplayID: CGDirectDisplayID, targetScreen: NSScreen) {
         self.sourceDisplayID = sourceDisplayID
         self.targetScreen = targetScreen
+        super.init()
     }
 
     func start() {
@@ -159,6 +161,56 @@ class StreamController {
 
         // Start ScreenCaptureKit capture
         startSCKCapture()
+
+        // Listen for screen wake/unlock to restart stream
+        registerWakeObservers()
+    }
+
+    func registerWakeObservers() {
+        let ws = NSWorkspace.shared.notificationCenter
+        let nc = DistributedNotificationCenter.default()
+
+        // Screen wake from sleep
+        ws.addObserver(self, selector: #selector(handleWake(_:)),
+                       name: NSWorkspace.screensDidWakeNotification, object: nil)
+        // Session becomes active (unlock / screensaver dismiss)
+        ws.addObserver(self, selector: #selector(handleWake(_:)),
+                       name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+        // Screen unlock (covers screensaver + lock screen)
+        nc.addObserver(self, selector: #selector(handleWake(_:)),
+                       name: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil)
+
+        print("✓ Registered wake/unlock observers for stream recovery")
+    }
+
+    @objc func handleWake(_ notification: Notification) {
+        guard !isRestarting else { return }
+        isRestarting = true
+        let reason = notification.name.rawValue.components(separatedBy: ".").last ?? "unknown"
+        print("⟳ Wake/unlock detected (\(reason)), restarting stream in 2s...")
+
+        // Delay to let displays stabilize after wake
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.restartStream()
+        }
+    }
+
+
+    func restartStream() {
+        // Stop existing stream
+        if let stream = scStream {
+            stream.stopCapture { [weak self] _ in
+                DispatchQueue.main.async {
+                    self?.scStream = nil
+                    self?.streamOutput = nil
+                    self?.startSCKCapture()
+                    self?.isRestarting = false
+                }
+            }
+        } else {
+            startSCKCapture()
+            isRestarting = false
+        }
     }
 
     func startSCKCapture() {
@@ -215,6 +267,8 @@ class StreamController {
     }
 
     func stop() {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        DistributedNotificationCenter.default().removeObserver(self)
         scStream?.stopCapture { _ in }
         scStream = nil
         window?.close()
