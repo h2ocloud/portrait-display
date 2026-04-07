@@ -108,6 +108,8 @@ class StreamOutput: NSObject, SCStreamOutput {
 class StreamController: NSObject {
     let sourceDisplayID: CGDirectDisplayID
     let targetScreen: NSScreen
+    let targetWidth: Int
+    let targetHeight: Int
     var window: NSWindow?
     var imageLayer: CALayer?
     var scStream: SCStream?
@@ -117,6 +119,8 @@ class StreamController: NSObject {
     init(sourceDisplayID: CGDirectDisplayID, targetScreen: NSScreen) {
         self.sourceDisplayID = sourceDisplayID
         self.targetScreen = targetScreen
+        self.targetWidth = Int(targetScreen.frame.width)
+        self.targetHeight = Int(targetScreen.frame.height)
         super.init()
     }
 
@@ -164,6 +168,35 @@ class StreamController: NSObject {
 
         // Listen for screen wake/unlock to restart stream
         registerWakeObservers()
+
+        // Monitor for display disconnect — if USB adapter is unplugged,
+        // close the fullscreen window immediately to avoid covering the MacBook screen
+        registerDisplayChangeCallback()
+    }
+
+    func registerDisplayChangeCallback() {
+        CGDisplayRegisterReconfigurationCallback({ displayID, flags, userInfo in
+            // Only react when reconfiguration is complete
+            guard flags.contains(.beginConfigurationFlag) == false else { return }
+            let controller = Unmanaged<StreamController>.fromOpaque(userInfo!).takeUnretainedValue()
+            controller.checkTargetDisplayAlive()
+        }, Unmanaged.passUnretained(self).toOpaque())
+        print("✓ Registered display disconnect watchdog")
+    }
+
+    func checkTargetDisplayAlive() {
+        // Check if any screen still matches our target dimensions
+        let targetAlive = NSScreen.screens.contains(where: { screen in
+            Int(screen.frame.width) == targetWidth && Int(screen.frame.height) == targetHeight
+        })
+
+        if !targetAlive {
+            print("⚠ Target display (\(targetWidth)x\(targetHeight)) disconnected — shutting down to avoid covering MacBook screen")
+            DispatchQueue.main.async {
+                self.stop()
+                NSApp.terminate(nil)
+            }
+        }
     }
 
     func registerWakeObservers() {
@@ -267,6 +300,10 @@ class StreamController: NSObject {
     }
 
     func stop() {
+        CGDisplayRemoveReconfigurationCallback({ displayID, flags, userInfo in
+            let controller = Unmanaged<StreamController>.fromOpaque(userInfo!).takeUnretainedValue()
+            controller.checkTargetDisplayAlive()
+        }, Unmanaged.passUnretained(self).toOpaque())
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         DistributedNotificationCenter.default().removeObserver(self)
         scStream?.stopCapture { _ in }
@@ -300,21 +337,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func startPortraitStreaming(args: [String]) {
         let targetDisplayID: CGDirectDisplayID? = args.count > 2 ? UInt32(args[2]) : nil
 
-        print("Step 1: Creating virtual portrait display (1080x1920)...")
-        guard let vd = createVirtualDisplay(width: 1080, height: 1920) else {
-            NSApp.terminate(nil)
-            return
-        }
-        virtualDisplay = vd
-        print("✓ Virtual display ID: \(vd.displayID)")
-
-        // Wait for display to register
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [self] in
-            self.setupStreaming(virtualDisplayID: vd.displayID, targetDisplayID: targetDisplayID)
-        }
-    }
-
-    func setupStreaming(virtualDisplayID: CGDirectDisplayID, targetDisplayID: CGDirectDisplayID?) {
+        // IMPORTANT: Capture the target NSScreen BEFORE creating the virtual display,
+        // because MCT USB displays may disappear from the active display list
+        // when a CGVirtualDisplay is created.
         let displays = getDisplays()
         printDisplays(displays)
 
@@ -328,9 +353,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             target = found
         } else {
             let candidates = displays.filter { d in
-                !d.isMain && d.id != virtualDisplayID && d.rotation == 0
+                !d.isMain && d.rotation == 0
             }
-            // Prefer 1920x1080 display (Samsung C24F390) as portrait target
             if let preferred = candidates.first(where: { $0.width == 1920 && $0.height == 1080 }) {
                 target = preferred
             } else if candidates.count == 1 {
@@ -344,8 +368,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
         }
-        print("Step 2: Target → ID:\(target.id) \(target.width)x\(target.height)")
 
+        // Lock the target NSScreen by frame position before virtual display creation
         guard let targetScreen = NSScreen.screens.first(where: { screen in
             let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
             return num == target.id
@@ -354,34 +378,95 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
             return
         }
+        let targetFrame = targetScreen.frame
+        print("Step 1: Locked target → ID:\(target.id) \(target.width)x\(target.height) frame:\(targetFrame)")
+
+        print("Step 2: Creating virtual portrait display (1080x1920)...")
+        guard let vd = createVirtualDisplay(width: 1080, height: 1920) else {
+            NSApp.terminate(nil)
+            return
+        }
+        virtualDisplay = vd
+        print("✓ Virtual display ID: \(vd.displayID)")
+
+        // Wait for virtual display to register, then find target screen by saved frame
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [self] in
+            self.setupStreaming(virtualDisplayID: vd.displayID, savedTargetFrame: targetFrame, targetWidth: target.width, targetHeight: target.height)
+        }
+    }
+
+    func setupStreaming(virtualDisplayID: CGDirectDisplayID, savedTargetFrame: CGRect, targetWidth: Int, targetHeight: Int) {
+        let logFile = "/tmp/portrait-display-debug.log"
+        var debugLines = [String]()
+        debugLines.append("[\(Date())] setupStreaming: saved frame:\(savedTargetFrame)")
+
+        // Re-scan NSScreens and match by frame origin (most stable identifier)
+        for screen in NSScreen.screens {
+            let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
+            debugLines.append("  NSScreen ID:\(num) frame:\(screen.frame)")
+        }
+
+        // Try matching by frame origin (position persists even if ID changes)
+        var targetScreen = NSScreen.screens.first(where: { screen in
+            screen.frame.origin == savedTargetFrame.origin &&
+            Int(screen.frame.width) == Int(savedTargetFrame.width) &&
+            Int(screen.frame.height) == Int(savedTargetFrame.height)
+        })
+
+        // Fallback: match by frame size only, excluding main and virtual
+        if targetScreen == nil {
+            debugLines.append("  Frame origin match failed, falling back to size match")
+            targetScreen = NSScreen.screens.first(where: { screen in
+                let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
+                return num != 1 && num != virtualDisplayID &&
+                    Int(screen.frame.width) == targetWidth && Int(screen.frame.height) == targetHeight
+            })
+        }
+
+        guard let targetScreen = targetScreen else {
+            debugLines.append("  ERROR: No NSScreen matched — target may have disconnected")
+            try? debugLines.joined(separator: "\n").appending("\n").write(toFile: logFile, atomically: true, encoding: .utf8)
+            print("ERROR: Target screen disappeared after virtual display creation")
+            print("  This is a known MCT driver issue. Try the hardware fallback approach.")
+            NSApp.terminate(nil)
+            return
+        }
+
+        let matchedID = targetScreen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
+        debugLines.append("  ✓ Matched NSScreen ID:\(matchedID) frame:\(targetScreen.frame)")
+        try? debugLines.joined(separator: "\n").appending("\n").write(toFile: logFile, atomically: true, encoding: .utf8)
+        print("Step 3: Target screen matched → ID:\(matchedID) frame:\(targetScreen.frame)")
 
         print("Step 3: Starting stream...")
         let ctrl = StreamController(sourceDisplayID: virtualDisplayID, targetScreen: targetScreen)
         ctrl.start()
         self.streamController = ctrl
-
-        print("""
-
-        ╔══════════════════════════════════════════════════╗
-        ║  Portrait Virtual Display — ACTIVE               ║
-        ╠══════════════════════════════════════════════════╣
-        ║  Virtual workspace: 1080x1920 (portrait)         ║
-        ║  Streaming to:      ID:\(target.id) (\(target.width)x\(target.height))      ║
-        ║                                                  ║
-        ║  → System Settings → Displays → Arrange          ║
-        ║  → Position "Portrait Virtual" where you want    ║
-        ║  → Drag windows to the virtual display           ║
-        ║  → Physically rotate your monitor 90°            ║
-        ║                                                  ║
-        ║  Ctrl+C to stop                                  ║
-        ╚══════════════════════════════════════════════════╝
-        """)
+        printBanner(targetID: matchedID, targetWidth: targetWidth, targetHeight: targetHeight)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         streamController?.stop()
         virtualDisplay = nil
     }
+}
+
+func printBanner(targetID: CGDirectDisplayID, targetWidth: Int, targetHeight: Int) {
+    print("""
+
+    ╔══════════════════════════════════════════════════╗
+    ║  Portrait Virtual Display — ACTIVE               ║
+    ╠══════════════════════════════════════════════════╣
+    ║  Virtual workspace: 1080x1920 (portrait)         ║
+    ║  Streaming to:      ID:\(targetID) (\(targetWidth)x\(targetHeight))      ║
+    ║                                                  ║
+    ║  → System Settings → Displays → Arrange          ║
+    ║  → Position "Portrait Virtual" where you want    ║
+    ║  → Drag windows to the virtual display           ║
+    ║  → Physically rotate your monitor 90°            ║
+    ║                                                  ║
+    ║  Ctrl+C to stop                                  ║
+    ╚══════════════════════════════════════════════════╝
+    """)
 }
 
 func printUsage() {
